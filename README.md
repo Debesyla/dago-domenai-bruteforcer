@@ -12,7 +12,7 @@ A simple, robust scanner for querying the .lt Domain Availability Service (DAS).
 
 ## Quick Start
 
-1. Prepare `assets/input.txt` with one domain per line (e.g., `example.lt`).
+1. Prepare `assets/input.txt` with one domain per line (e.g., `example.lt`). See `assets/input_example.txt` for a sample input file.
 2. Run: `python3 src/das_scanner.py`
 3. Results in `scan_state.db` and `assets/output/`.
 
