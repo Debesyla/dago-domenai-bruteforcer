@@ -217,8 +217,21 @@ class PickerThread(threading.Thread):
 
     def run(self):
         self._conn = get_db_conn(self.db_path)
+        # Queue to store domains that need to be marked back
+        self._requeue_domains = []
+        
         try:
             while not self.shutdown_event.is_set():
+                # First, handle any domains that need re-queuing
+                if self._requeue_domains:
+                    try:
+                        self._mark_back(self._requeue_domains)
+                        self._requeue_domains = []
+                    except Exception as e:
+                        print(f"[PICKER] Failed to re-queue domains: {e}")
+                        time.sleep(0.5)
+                        continue
+                
                 # small sleep to avoid busy spin when no pending rows exist
                 pending_batch = self._pick_batch(PICK_BATCH_SIZE)
                 if not pending_batch:
@@ -227,25 +240,33 @@ class PickerThread(threading.Thread):
                     continue
                 
                 # push to asyncio picker_queue thread-safely
-                # Use a wrapper function to handle QueueFull in the event loop
+                # Store reference to self for closure
+                picker_self = self
+                pending_batch_ref = pending_batch
+                
                 def safe_put():
                     try:
-                        self.picker_queue.put_nowait(pending_batch)
+                        picker_self.picker_queue.put_nowait(pending_batch_ref)
                     except asyncio.QueueFull:
-                        # Queue is full, schedule re-queue via thread
-                        import threading
-                        threading.Thread(target=self._mark_back, args=(pending_batch,), daemon=True).start()
+                        # Queue is full, add to requeue list (picker thread will handle it)
+                        picker_self._requeue_domains.extend(pending_batch_ref)
                 
                 try:
                     self.loop.call_soon_threadsafe(safe_put)
                     # Small sleep to allow workers to consume
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                 except Exception as e:
                     # fallback: if cannot schedule callback, mark them back
                     print(f"[PICKER] Failed to schedule batch: {e}. Re-queuing domains.")
-                    self._mark_back(pending_batch)
+                    self._requeue_domains.extend(pending_batch)
                     time.sleep(0.2)
         finally:
+            # Final requeue attempt
+            if self._requeue_domains:
+                try:
+                    self._mark_back(self._requeue_domains)
+                except Exception:
+                    pass
             try:
                 self._conn.close()
             except Exception:
@@ -287,11 +308,21 @@ class PickerThread(threading.Thread):
         """
         Set in_progress=0 for given domains.
         Used when we failed to dispatch picked domains to workers.
+        Must be called from the picker thread only.
         """
+        if not domains:
+            return
         cur = self._conn.cursor()
-        qmarks = ",".join("?" for _ in domains)
-        cur.execute(f"UPDATE domains SET in_progress=0 WHERE domain IN ({qmarks});", tuple(domains))
-        self._conn.commit()
+        try:
+            qmarks = ",".join("?" for _ in domains)
+            cur.execute(f"UPDATE domains SET in_progress=0 WHERE domain IN ({qmarks});", tuple(domains))
+            self._conn.commit()
+        except Exception as e:
+            print(f"[PICKER] Error marking domains back: {e}")
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
 
 
 # ------------------------
@@ -696,27 +727,21 @@ async def progress_logger(
                     should_log = True
             
             if should_log:
-                now = time.time()
-                elapsed_total = now - start_time
-                elapsed_interval = now - last_log_time
-                domains_interval = db_completed - last_logged
-
-                # Instantaneous rate over the last interval
-                rps = (domains_interval / elapsed_interval) if elapsed_interval > 0 else 0.0
-                eta_days = (remaining / rps / 86400) if rps > 0 else float("inf")
+                elapsed = now - start_time
+                rps = (db_completed / elapsed) if elapsed > 0 else 0.0
+                eta_days = (remaining / rps / 3600 / 24) if rps > 0 else float("inf")
                 pct = (db_completed / total * 100) if total > 0 else 0.0
-
+                
                 # Status breakdown
                 cur.execute("SELECT status, COUNT(*) FROM domains WHERE status != 'pending' GROUP BY status;")
                 counts = cur.fetchall()
                 status_parts = " ".join(f"{s}={c}" for s, c in counts)
-
-                print(f"[PROGRESS] Processed {db_completed}/{total} ({pct:.2f}%) | {rps:.1f} req/sec | ETA: {eta_days:.2f} days")
-                print(f"[PROGRESS] Status: {status_parts}")
-
-                last_log_time = now
-                last_logged = db_completed
                 
+                print(f"[PROGRESS] Processed {db_completed}/{total} ({pct:.2f}%) | {rps:.1f} req/sec | ETA: {eta_days:.1f} days")
+                print(f"[PROGRESS] Status: {status_parts}")
+                
+                last_logged = db_completed
+                last_log_time = now
     finally:
         conn.close()
 
