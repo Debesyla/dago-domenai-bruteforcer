@@ -254,7 +254,7 @@ OUTPUT_DIR = "assets/output"
 
 # Performance
 RATE = 30                    # requests/sec
-CONCURRENCY = 40             # worker tasks (reduced for stability)
+CONCURRENCY = 40             # worker tasks
 CHECK_TIMEOUT = 6            # seconds
 MAX_RETRIES = 1              # additional attempt
 
