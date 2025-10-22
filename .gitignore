@@ -156,4 +156,6 @@ assets/input.txt
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
