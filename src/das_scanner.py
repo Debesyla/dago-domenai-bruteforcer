@@ -47,7 +47,7 @@ WRITE_BATCH_SIZE = 1000
 FILE_BUFFER_SIZE = 10000
 
 # Logging / progress
-PROGRESS_INTERVAL = 10000  # domains between progress logs
+PROGRESS_INTERVAL = 1800  # domains between progress logs
 IMPORT_LOG_INTERVAL = 100000
 
 # DAS server
@@ -225,13 +225,24 @@ class PickerThread(threading.Thread):
                     # no pending rows: sleep a bit
                     time.sleep(0.25)
                     continue
+                
                 # push to asyncio picker_queue thread-safely
+                # Use a wrapper function to handle QueueFull in the event loop
+                def safe_put():
+                    try:
+                        self.picker_queue.put_nowait(pending_batch)
+                    except asyncio.QueueFull:
+                        # Queue is full, schedule re-queue via thread
+                        import threading
+                        threading.Thread(target=self._mark_back, args=(pending_batch,), daemon=True).start()
+                
                 try:
-                    # call_soon_threadsafe to schedule a coroutine queue.put_nowait
-                    self.loop.call_soon_threadsafe(self.picker_queue.put_nowait, pending_batch)
+                    self.loop.call_soon_threadsafe(safe_put)
+                    # Small sleep to allow workers to consume
+                    time.sleep(0.1)
                 except Exception as e:
-                    # fallback: if cannot put, mark them back
-                    print(f"[PICKER] Failed to push batch to asyncio queue: {e}. Re-queuing domains.")
+                    # fallback: if cannot schedule callback, mark them back
+                    print(f"[PICKER] Failed to schedule batch: {e}. Re-queuing domains.")
                     self._mark_back(pending_batch)
                     time.sleep(0.2)
         finally:
@@ -637,6 +648,21 @@ async def progress_logger(
         last_log_time = time.time()
         start_time = time.time()
         
+        # Log initial status immediately
+        await asyncio.sleep(2)  # Give workers 2 seconds to start
+        cur.execute(
+            "SELECT "
+            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as remaining, "
+            "SUM(CASE WHEN status!='pending' THEN 1 ELSE 0 END) as completed, "
+            "COUNT(*) as total "
+            "FROM domains;"
+        )
+        row = cur.fetchone()
+        remaining = int(row[0] or 0)
+        db_completed = int(row[1] or 0)
+        total = int(row[2] or 0)
+        print(f"[PROGRESS] Starting: {db_completed}/{total} already completed, {remaining} remaining")
+        
         while not shutdown_flag.is_set():
             await asyncio.sleep(5)  # check every 5 seconds
             
@@ -670,21 +696,27 @@ async def progress_logger(
                     should_log = True
             
             if should_log:
-                elapsed = now - start_time
-                rps = (db_completed / elapsed) if elapsed > 0 else 0.0
-                eta_days = (remaining / rps / 3600 / 24) if rps > 0 else float("inf")
+                now = time.time()
+                elapsed_total = now - start_time
+                elapsed_interval = now - last_log_time
+                domains_interval = db_completed - last_logged
+
+                # Instantaneous rate over the last interval
+                rps = (domains_interval / elapsed_interval) if elapsed_interval > 0 else 0.0
+                eta_days = (remaining / rps / 86400) if rps > 0 else float("inf")
                 pct = (db_completed / total * 100) if total > 0 else 0.0
-                
+
                 # Status breakdown
                 cur.execute("SELECT status, COUNT(*) FROM domains WHERE status != 'pending' GROUP BY status;")
                 counts = cur.fetchall()
                 status_parts = " ".join(f"{s}={c}" for s, c in counts)
-                
-                print(f"[PROGRESS] Processed {db_completed}/{total} ({pct:.2f}%) | {rps:.1f} req/sec | ETA: {eta_days:.1f} days")
+
+                print(f"[PROGRESS] Processed {db_completed}/{total} ({pct:.2f}%) | {rps:.1f} req/sec | ETA: {eta_days:.2f} days")
                 print(f"[PROGRESS] Status: {status_parts}")
-                
-                last_logged = db_completed
+
                 last_log_time = now
+                last_logged = db_completed
+                
     finally:
         conn.close()
 
@@ -783,6 +815,7 @@ async def main_async(args):
         return
     
     print(f"[MAIN] {pending_count} domains pending")
+    print(f"[MAIN] Progress will be logged every {PROGRESS_INTERVAL if pending_count >= PROGRESS_INTERVAL else '5 seconds for small datasets'}")
 
     # Wait for workers to finish (they stop when shutdown_flag set or no more work)
     try:
