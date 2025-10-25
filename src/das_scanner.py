@@ -727,8 +727,10 @@ async def progress_logger(
                     should_log = True
             
             if should_log:
-                elapsed = now - start_time
-                rps = (db_completed / elapsed) if elapsed > 0 else 0.0
+                # Calculate req/sec based on domains completed since last log
+                domains_since_last = db_completed - last_logged
+                time_since_last = now - last_log_time
+                rps = (domains_since_last / time_since_last) if time_since_last > 0 else 0.0
                 eta_days = (remaining / rps / 3600 / 24) if rps > 0 else float("inf")
                 pct = (db_completed / total * 100) if total > 0 else 0.0
                 
