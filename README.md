@@ -2,6 +2,10 @@
 
 A simple, robust scanner for querying the .lt Domain Availability Service (DAS). It processes a large list of .lt domains from a text file, checks their status via the DAS protocol, and stores results in a SQLite database and separate text files per status.
 
+## AI notice
+
+This readme.md and most of the code was AI-generated, human reviewed.
+
 ## Features
 
 - Processes 60M+ domains efficiently
@@ -27,7 +31,3 @@ See [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for full specification
 ## License
 
 Do whatever.
-
-## AI notice
-
-This readme.md and most of the code was AI-generated, human reviewed.
